@@ -1,0 +1,174 @@
+;; Зберігаємо дані контракту: власник, орендар, NFT, ціна, час закінчення, деактивація, ключ і адреса платформи
+() set_data(slice owner_addr, int renter_pubkey, slice nft_addr, int price, int rental_end_time, int is_deactivated, int platform_pubkey, slice platform_addr) inline {
+    var cell = begin_cell()
+        .store_addr(owner_addr)
+        .store_uint(renter_pubkey, 256)
+        .store_addr(nft_addr)
+        .store_uint(price, 64)
+        .store_uint(rental_end_time, 32)
+        .store_uint(is_deactivated, 1)
+        .store_uint(platform_pubkey, 256)
+        .store_addr(platform_addr)
+        .end_cell();
+    set_data(cell);
+}
+
+;; Отримуємо дані контракту
+(slice, int, slice, int, int, int, int, slice) get_data() inline {
+    var data = get_data();
+    if (data.cell_empty?()) {
+        return (0, 0, 0, 0, 0, 0, 0, 0);
+    }
+    var s = data.begin_parse();
+    return (
+        s.load_addr(),
+        s.load_uint(256),
+        s.load_addr(),
+        s.load_uint(64),
+        s.load_uint(32),
+        s.load_uint(1),
+        s.load_uint(256),
+        s.load_addr()
+    );
+}
+
+;; Парсинг вхідного повідомлення
+(slice, int, slice) parse_internal_msg(slice in_msg) inline {
+    var sender = in_msg.load_addr();
+    var value = in_msg.load_grams();
+    var body = in_msg;
+    return (sender, value, body);
+}
+
+;; Парсинг manifest_url з deeplink
+(string) parse_deeplink_manifest(string deeplink) inline {
+    ;; Спрощуємо для демонстрації, у реальній реалізації потрібен JSON парсер
+    return "https://fragment.com/tonconnect-manifest.json";
+}
+
+;; Перевірка та автоматичне повернення NFT, якщо оренда закінчилася
+() check_and_return_nft() inline {
+    var (owner_addr, renter_pubkey, nft_addr, price, rental_end_time, is_deactivated, platform_pubkey, platform_addr) = get_data();
+    if (is_deactivated == 0) {
+        if (rental_end_time > 0) {
+            if (now() >= rental_end_time) {
+                ;; Повертаємо NFT власнику
+                send_raw_message(nft_addr, 0, 64); ;; 64 - режим повернення NFT
+                ;; Деактивуємо контракт і скидаємо дані оренди
+                set_data(owner_addr, 0, 0, 0, 0, 1, platform_pubkey, platform_addr);
+            }
+        }
+    }
+}
+
+;; Обробка вхідних повідомлень
+() recv_internal(slice in_msg) impure {
+    ;; Перевіряємо, чи потрібно повернути NFT
+    check_and_return_nft();
+    
+    ;; Отримуємо дані зі стану контракту
+    var (owner_addr, renter_pubkey, nft_addr, price, rental_end_time, is_deactivated, platform_pubkey, platform_addr) = get_data();
+    
+    ;; Перевіряємо, чи контракт не деактивовано
+    throw_unless(100, is_deactivated == 0);
+    
+    ;; Парсимо вхідне повідомлення
+    var (sender, value, msg_body) = parse_internal_msg(in_msg);
+    
+    ;; Перевіряємо, чи повідомлення від власника
+    var is_owner = (sender == owner_addr);
+    
+    ;; Ініціалізація контракту
+    if (owner_addr == 0) {
+        throw_unless(101, is_owner); ;; Тільки власник може ініціалізувати
+        var platform_pubkey = msg_body.load_uint(256); ;; Публічний ключ платформи
+        var platform_addr = msg_body.load_addr(); ;; Адреса платформи
+        set_data(sender, 0, 0, 0, 0, 0, platform_pubkey, platform_addr); ;; Встановлюємо власника та платформу
+        return ();
+    }
+    
+    ;; Обробка відправки NFT на контракт
+    if (is_owner) {
+        if (msg_body.slice_refs() > 0) {
+            throw_unless(102, rental_end_time == 0); ;; NFT не має бути в оренді
+            var nft_slice = msg_body.begin_parse();
+            throw_unless(103, nft_slice.slice_bits() >= 256); ;; Перевіряємо, що є адреса NFT
+            var new_nft_addr = nft_slice.load_addr();
+            var new_price = msg_body.load_uint(64); ;; Ціна оренди (в наноTON)
+            throw_unless(104, new_price > 0); ;; Ціна має бути позитивною
+            var duration = msg_body.load_uint(32); ;; Тривалість оренди (в секундах)
+            throw_unless(105, duration >= 604800); ;; Мінімум 1 тиждень (604,800 секунд)
+            var current_time = now();
+            var new_rental_end_time = current_time + duration; ;; Без буфера часу
+            
+            ;; Зберігаємо дані оренди
+            set_data(owner_addr, 0, new_nft_addr, new_price, new_rental_end_time, 0, platform_pubkey, platform_addr);
+            return ();
+        }
+    }
+    
+    ;; Обробка оренди (орендар відправляє TON)
+    if (~is_owner) {
+        if (value >= price) {
+            if (rental_end_time == 0) {
+                throw_unless(106, renter_pubkey == 0); ;; Перевіряємо, що NFT ще не в оренді
+                var new_renter_pubkey = msg_body.load_uint(256); ;; Публічний ключ орендаря
+                ;; Розраховуємо роялті (20% від суми оренди)
+                var royalty = value / 5; ;; 20% = value / 5
+                var owner_amount = value - royalty; ;; Сума для власника
+                ;; Переказуємо роялті платформі
+                send_raw_message(platform_addr, royalty, 3);
+                ;; Переказуємо залишок власнику
+                send_raw_message(owner_addr, owner_amount, 3);
+                ;; Зберігаємо дані орендаря
+                set_data(owner_addr, new_renter_pubkey, nft_addr, price, rental_end_time, 0, platform_pubkey, platform_addr);
+                return ();
+            }
+        }
+    }
+    
+    throw(107); ;; Некоректне повідомлення
+}
+
+;; Повертає публічний ключ контракту
+(slice) get_public_key() method_id {
+    ;; Перевіряємо, чи потрібно повернути NFT
+    check_and_return_nft();
+    
+    var pubkey = get_data().begin_parse().load_uint(256); ;; Отримуємо ключ контракту
+    return begin_cell().store_uint(pubkey, 256).end_cell().begin_parse();
+}
+
+;; Перевірка deeplink та підписів
+(slice) get_code(slice deeplink, slice renter_signature, slice platform_signature) method_id {
+    ;; Перевіряємо, чи потрібно повернути NFT
+    check_and_return_nft();
+    
+    var (owner_addr, renter_pubkey, _, _, _, is_deactivated, platform_pubkey, _) = get_data();
+    throw_unless(108, is_deactivated == 0); ;; Контракт не має бути деактивованим
+    throw_unless(109, renter_pubkey != 0); ;; Перевіряємо, що орендар існує
+    
+    ;; Парсимо deeplink
+    var deeplink_str = deeplink.load_string();
+    throw_unless(110, deeplink_str.begins_with("tc://?v=2&id=")); ;; Перевіряємо формат
+    
+    ;; Перевіряємо manifestUrl
+    var manifest_url = parse_deeplink_manifest(deeplink_str);
+    throw_unless(111, manifest_url == "https://fragment.com/tonconnect-manifest.json");
+    
+    ;; Отримуємо публічний ключ контракту
+    var contract_pubkey = get_data().begin_parse().load_uint(256);
+    
+    ;; Перевіряємо підпис орендаря (підпис deeplink)
+    var deeplink_hash = sha256(deeplink);
+    var is_renter_valid = check_signature(deeplink_hash, renter_signature, contract_pubkey);
+    throw_unless(112, is_renter_valid); ;; Перевіряємо валідність підпису орендаря
+    
+    ;; Перевіряємо підпис платформи (підпис публічного ключа орендаря)
+    var renter_pubkey_hash = sha256(begin_cell().store_uint(renter_pubkey, 256).end_cell());
+    var is_platform_valid = check_signature(renter_pubkey_hash, platform_signature, platform_pubkey);
+    throw_unless(113, is_platform_valid); ;; Перевіряємо валідність підпису платформи
+    
+    ;; Повертаємо підтвердження
+    return begin_cell().store_uint(1, 8).end_cell().begin_parse();
+}
